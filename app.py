@@ -1,6 +1,9 @@
 import csv
 import io
 import os
+import secrets
+import threading
+import time
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -9,11 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import desc, func, inspect, or_, select, text
+from sqlalchemy import desc, func, inspect, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from database import Base, SessionLocal, engine, get_db
-from mercadopago_client import gerar_pix, testar_conexao, verificar_pagamento
+from mercadopago_client import gerar_pix, testar_conexao, verificar_pagamento, validar_webhook
 from models import Configuracao, Order
 from smm_client import buscar_servicos, consultar_saldo, enviar_pedido_smm, configure as configure_smm
 from mercadopago_client import configure as configure_mercadopago
@@ -41,12 +44,38 @@ finally:
 app = FastAPI(title="Orbit SMM Console", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000").split(",") if origin.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    if request.url.path == "/landing" or request.url.path.startswith("/static/landing"):
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "base-uri 'self'; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'"
+        )
+    return response
 app.mount("/static", StaticFiles(directory="static"), name="static")
+_public_order_attempts: dict[str, list[float]] = {}
+_public_order_lock = threading.Lock()
 
 
 class CreateOrderRequest(BaseModel):
@@ -85,6 +114,15 @@ def mask_secret(value: str) -> str:
     if len(value) <= 8:
         return "••••••••"
     return f"{value[:4]}••••{value[-4:]}"
+
+
+def require_admin(request: Request) -> None:
+    configured_key = os.getenv("ADMIN_API_KEY", "").strip()
+    if not configured_key:
+        raise HTTPException(status_code=503, detail="ADMIN_API_KEY não configurada no servidor.")
+    supplied_key = request.headers.get("X-Admin-Key", "")
+    if not supplied_key or not secrets.compare_digest(supplied_key, configured_key):
+        raise HTTPException(status_code=401, detail="Autenticação administrativa necessária.")
 
 
 def platform_from_category(category: str, name: str) -> str:
@@ -141,6 +179,11 @@ def home() -> FileResponse:
     return FileResponse("static/index.html")
 
 
+@app.get("/landing")
+def landing() -> FileResponse:
+    return FileResponse("static/landing.html")
+
+
 @app.get("/api/servicos")
 def services(db: Session = Depends(get_db)) -> list[dict]:
     configuration = get_configuration(db)
@@ -159,7 +202,7 @@ def catalog(db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/api/config")
-def read_config(db: Session = Depends(get_db)) -> dict:
+def read_config(db: Session = Depends(get_db), _: None = Depends(require_admin)) -> dict:
     configuration = get_configuration(db)
     return {
         "smm_api_url": configuration.smm_api_url,
@@ -170,7 +213,7 @@ def read_config(db: Session = Depends(get_db)) -> dict:
 
 
 @app.post("/api/config")
-def save_config(payload: ConfigRequest, db: Session = Depends(get_db)) -> dict:
+def save_config(payload: ConfigRequest, db: Session = Depends(get_db), _: None = Depends(require_admin)) -> dict:
     configuration = get_configuration(db)
     configuration.smm_api_url = payload.smm_api_url.strip().rstrip("/")
     configuration.smm_api_key = payload.smm_api_key.strip()
@@ -183,7 +226,7 @@ def save_config(payload: ConfigRequest, db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/api/smm/saldo")
-def provider_balance() -> dict:
+def provider_balance(_: None = Depends(require_admin)) -> dict:
     try:
         return consultar_saldo()
     except Exception as exc:
@@ -191,7 +234,7 @@ def provider_balance() -> dict:
 
 
 @app.get("/api/mercadopago/testar")
-def mercado_pago_connection() -> dict:
+def mercado_pago_connection(_: None = Depends(require_admin)) -> dict:
     try:
         return testar_conexao()
     except Exception as exc:
@@ -199,7 +242,7 @@ def mercado_pago_connection() -> dict:
 
 
 @app.get("/api/analytics")
-def analytics(db: Session = Depends(get_db)) -> dict:
+def analytics(db: Session = Depends(get_db), _: None = Depends(require_admin)) -> dict:
     now = datetime.utcnow()
     seven_days_ago = now - timedelta(days=6)
     thirty_days_ago = now - timedelta(days=29)
@@ -231,7 +274,15 @@ def analytics(db: Session = Depends(get_db)) -> dict:
 
 
 @app.post("/api/pedidos/criar")
-def create_order(payload: CreateOrderRequest, db: Session = Depends(get_db)) -> dict:
+def create_order(payload: CreateOrderRequest, request: Request, db: Session = Depends(get_db)) -> dict:
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    with _public_order_lock:
+        recent_attempts = [attempt for attempt in _public_order_attempts.get(client_ip, []) if now - attempt < 60]
+        if len(recent_attempts) >= 10:
+            raise HTTPException(status_code=429, detail="Muitos pedidos em pouco tempo. Aguarde um minuto e tente novamente.")
+        recent_attempts.append(now)
+        _public_order_attempts[client_ip] = recent_attempts
     platform_key = payload.plataforma.strip().lower()
     service_type = payload.tipo_servico.strip().lower()
     type_aliases = {
@@ -305,6 +356,7 @@ def list_orders(
     search: str = Query("", max_length=200),
     status: str = Query("", max_length=30),
     db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
 ) -> list[dict]:
     statement = select(Order).order_by(desc(Order.created_at))
     if search:
@@ -315,7 +367,7 @@ def list_orders(
 
 
 @app.get("/api/dashboard/kpis")
-def dashboard_kpis(db: Session = Depends(get_db)) -> dict:
+def dashboard_kpis(db: Session = Depends(get_db), _: None = Depends(require_admin)) -> dict:
     revenue = db.scalar(select(func.coalesce(func.sum(Order.customer_price), 0)).where(Order.status.in_(["paid", "processing", "completed"]))) or 0
     cost = db.scalar(select(func.coalesce(func.sum(Order.provider_cost), 0)).where(Order.status.in_(["paid", "processing", "completed"]))) or 0
     total = db.scalar(select(func.count(Order.id))) or 0
@@ -330,12 +382,18 @@ def _process_payment(payment_id: str, db: Session) -> None:
     order = db.scalar(select(Order).where(Order.external_payment_id == str(payment_id)))
     if not order or order.status != "pending":
         return
-    order.status = "paid"
-    order.paid_at = datetime.utcnow()
+    claimed_at = datetime.utcnow()
+    claimed = db.execute(
+        update(Order)
+        .where(Order.id == order.id, Order.status == "pending")
+        .values(status="processing", paid_at=claimed_at)
+    ).rowcount
+    db.commit()
+    if claimed != 1:
+        return
     try:
         provider_result = enviar_pedido_smm(order.link, order.quantity, order.service_id, order.comentarios)
         order.provider_order_id = str(provider_result["order"])
-        order.status = "processing"
     except Exception:
         order.status = "paid"
         db.commit()
@@ -345,6 +403,9 @@ def _process_payment(payment_id: str, db: Session) -> None:
 
 @app.post("/webhook/mercadopago")
 async def mercadopago_webhook(request: Request, db: Session = Depends(get_db)) -> dict:
+    body_bytes = await request.body()
+    if not validar_webhook(request.headers, body_bytes):
+        raise HTTPException(status_code=401, detail="Webhook não autenticado.")
     body = await request.json()
     payment_id = body.get("data", {}).get("id") or body.get("id")
     if payment_id:
@@ -352,11 +413,11 @@ async def mercadopago_webhook(request: Request, db: Session = Depends(get_db)) -
             _process_payment(str(payment_id), db)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Falha ao processar pagamento {payment_id}: {exc}") from exc
-    return {"received": True, "processed": bool(payment_id)}
+    return {"received": True}
 
 
 @app.get("/api/pedidos/exportar")
-def export_orders(db: Session = Depends(get_db)) -> StreamingResponse:
+def export_orders(db: Session = Depends(get_db), _: None = Depends(require_admin)) -> StreamingResponse:
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["ID", "Plataforma", "Tipo", "Link", "Serviço", "Quantidade", "Custo fornecedor", "Valor cliente", "Lucro", "Status", "Criado em"])

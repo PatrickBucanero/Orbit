@@ -1,4 +1,7 @@
+import hashlib
+import hmac
 import os
+import time
 from typing import Any
 
 import mercadopago
@@ -57,6 +60,38 @@ def testar_conexao() -> dict[str, Any]:
     if result.get("status", 500) >= 400:
         raise RuntimeError(f"Mercado Pago recusou o teste de conexão: {result.get('response', result)}")
     return {"connected": True}
+
+
+def validar_webhook(headers: Any, body: bytes) -> bool:
+    secret = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
+    if not secret:
+        return False
+    signature = headers.get("x-signature", "")
+    request_id = headers.get("x-request-id", "")
+    payment_id = ""
+    try:
+        import json
+        payload = json.loads(body.decode("utf-8"))
+        payment_id = str(payload.get("data", {}).get("id", ""))
+    except (ValueError, UnicodeDecodeError):
+        return False
+    values = {}
+    for part in signature.split(","):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            values[key.strip()] = value.strip()
+    timestamp = values.get("ts")
+    provided = values.get("v1")
+    if not timestamp or not provided or not request_id or not payment_id:
+        return False
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            return False
+    except ValueError:
+        return False
+    manifest = f"id:{payment_id};request-id:{request_id};ts:{timestamp};"
+    expected = hmac.new(secret.encode(), manifest.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, provided)
 
 
 gerar_cobranca_pix = gerar_pix
