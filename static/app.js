@@ -1,9 +1,26 @@
 const state = { services: [], timer: null, revenueChart: null, platformChart: null };
 const $ = (selector) => document.querySelector(selector);
 const money = (value) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(value || 0);
+let adminKey = sessionStorage.getItem("orbit_admin_key") || "";
+
+function askAdminKey() {
+  if (adminKey) return adminKey;
+  const entered = window.prompt("Informe a chave administrativa para acessar o painel:");
+  if (entered) {
+    adminKey = entered.trim();
+    sessionStorage.setItem("orbit_admin_key", adminKey);
+  }
+  return adminKey;
+}
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+  const { _retry, ...requestOptions } = options;
+  const headers = { "Content-Type": "application/json", ...(adminKey ? { "X-Admin-Key": adminKey } : {}), ...(requestOptions.headers || {}) };
+  let response = await fetch(path, { ...requestOptions, headers });
+  if (response.status === 401 && !_retry) {
+    askAdminKey();
+    response = await fetch(path, { ...requestOptions, headers: { ...headers, ...(adminKey ? { "X-Admin-Key": adminKey } : {}) } });
+  }
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.detail || "Não foi possível concluir a operação.");
   return payload;
@@ -132,7 +149,16 @@ $("#new-order-button").addEventListener("click", () => $("#new-order").scrollInt
 $("#close-modal").addEventListener("click", () => $("#payment-modal").classList.remove("open"));
 $("#payment-modal").addEventListener("click", (event) => { if (event.target.id === "payment-modal") $("#payment-modal").classList.remove("open"); });
 $("#copy-pix").addEventListener("click", async () => { await navigator.clipboard.writeText($("#pix-code").textContent); $("#copy-pix").textContent = "Copiado"; toast("Código PIX copiado."); setTimeout(() => $("#copy-pix").textContent = "Copiar", 1600); });
-$("#export-button").addEventListener("click", () => { window.location.href = "/api/pedidos/exportar"; });
+$("#export-button").addEventListener("click", async () => {
+  askAdminKey();
+  const response = await fetch("/api/pedidos/exportar", { headers: { "X-Admin-Key": adminKey } });
+  if (!response.ok) { toast("Chave administrativa inválida ou ausente."); return; }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url; link.download = "relatorio-pedidos.csv"; link.click();
+  URL.revokeObjectURL(url);
+});
 $("#order-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = event.currentTarget.querySelector("button[type=submit]");
